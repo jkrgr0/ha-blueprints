@@ -4,7 +4,7 @@ blueprint:
     Updates the Aqara TRV E1 temperature using an external temperature sensor.  
     This blueprint can only be used whith Aqara TRV E1 provided by Zigbee2MQTT!
   domain: automation
-  author: Janek Kröger (@jkrgr)
+  author: Janek Kröger (@jkrgr0)
   input:
     temperature_sensor:
       name: External temperature sensor
