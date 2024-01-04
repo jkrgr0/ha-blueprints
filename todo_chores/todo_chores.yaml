@@ -1,0 +1,215 @@
+blueprint:
+  name: Chore Management
+  author: jkrgr0
+  homeassistant:
+    min_version: 2023.1.0
+  description: '
+    ## Features
+
+    - 🔔 Receive notification when a task/chore is overdue or nearly due.
+    - ✅ Complete the task/chore directly through the received notification.
+      - ⏭️ Automatically reschedule a completed task/chore for the next interval.
+    - 🕒 Postpone the task/chore for a specific time directly through the received notification.
+
+    **❗ IMPORTANT: The minimum required version of Home Assistant is `2024.1.0` ❗**
+
+    ## Additional Information
+
+    **Version**: 0.1.0
+    '
+  source_url: https://github.com/jkrgr0/ha-blueprints/blob/main/todo_chores.yaml
+  domain: automation
+  input:
+    input_todo_list:
+      name: To-do list
+      description: The To-do list containing all chores.
+      selector:
+        entity:
+          filter:
+            - domain:
+              - todo
+    input_postpone_duration:
+      name: Postpone duration
+      description: Duration (in days) how long the chore should be postponed.
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 7
+          mode: slider
+          unit_of_measurement: d
+    input_notify_advance:
+      name: Notify in advance
+      description: How long (in hours) in advance a notification should be send before the chore is overdue.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 96
+          unit_of_measurement: h
+    input_notify_device:
+      name: Devices to notify
+      description: Devices which gets the notification.
+      default: []
+      selector:
+        device:
+          integration: mobile_app
+          multiple: true
+
+mode: parallel
+max: 10
+
+trigger_variables:
+  input_todo_list: !input input_todo_list
+  input_postpone_duration: !input input_postpone_duration
+  input_notify_advance: !input input_notify_advance
+  input_notify_device: !input input_notify_device
+
+trigger:
+  - platform: homeassistant
+    event: start
+    id: hastart
+  - platform: event
+    event_type: automation_reloaded
+  - platform: time_pattern
+    minutes: /5
+    id: time_trigger
+
+variables:
+  input_todo_list: !input input_todo_list
+  input_postpone_duration: !input input_postpone_duration
+  input_notify_advance: !input input_notify_advance
+  input_notify_device: !input input_notify_device
+
+action:
+  - alias: Delay if home assistant is just started
+    if:
+      - condition: trigger
+        id: hastart
+    then:
+      - delay:
+          seconds: 30
+  - alias: Get all todo items
+    service: todo.get_items
+    metadata: {}
+    target:
+      entity_id: "{{ input_todo_list }}"
+    response_variable: chore_list
+  - alias: Repeat for each chore
+    repeat:
+      for_each: "{{ chore_list[input_todo_list]['items'] }}"
+      sequence:
+        - alias: Set required variables
+          variables:
+            chore: "{{ repeat.item }}"
+            chore_icon: >-
+              {% if 'description' in repeat.item: %}
+                {% for item in repeat.item.description.split(';'): %}
+                  {% set key_val = item.split('=') %}
+                  {% if key_val[0] | trim() == 'icon': %}
+                    {{ key_val[1] | trim() }}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+            chore_repeat: >-
+              {% if 'description' in repeat.item: %}
+                {% for item in repeat.item.description.split(';'): %}
+                  {% set key_val = item.split('=') %}
+                  {% if key_val[0] | trim() == 'repeat': %}
+                    {{ key_val[1] | trim() }}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+            chore_overdue: >-
+              {{ repeat.item.status == 'needs_action' and as_datetime(repeat.item.due).timestamp() < now().timestamp() }}
+            chore_near_due: >-
+              {{ repeat.item.status == 'needs_action' and as_datetime(repeat.item.due).timestamp() < (now() + timedelta(hours=input_notify_advance)).timestamp() }}
+        - if:
+            - alias: If chore is incomplete and is overdue or nearly due
+              condition: template
+              value_template: >-
+                {{ chore_overdue or chore_near_due }}
+          then:
+            - alias: Set action variables
+              variables:
+                action_complete: "{{ 'COMPLETE_' ~ context.id }}"
+                action_postpone: "{{ 'POSTPONE_' ~ context.id }}"
+                action_suppress: "{{ 'SUPPRESS_' ~ context.id }}"
+            - alias: Send a notification to each device
+              repeat:
+                for_each: "{{ input_notify_device }}"
+                sequence:
+                  - alias: Notify device
+                    service: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}
+                    data:
+                      title: Chore is {{ 'nearly due' if not chore_overdue and chore_near_due else 'overdue' }}
+                      message: >-
+                        {{ chore.summary }} is {{ 'due in' if not chore_overdue and chore_near_due else 'overdue since' }} {{
+                        relative_time(as_datetime(chore.due))
+                        }}.
+                      data:
+                        notification_icon: >-
+                          {{ chore_icon if chore_icon != '' else 'mdi:broom' }}
+                        actions:
+                          - action: "{{ action_complete }}"
+                            title: Complete
+                          - action: "{{ action_postpone }}"
+                            title: "Postpone {{ input_postpone_duration }} day(s)"
+                          - action: "{{ action_suppress }}"
+                            title: Suppress
+            - alias: Wait for notification action
+              wait_for_trigger:
+                - alias: Complete action is pressed
+                  platform: event
+                  event_type: mobile_app_notification_action
+                  event_data:
+                    action: "{{ action_complete }}"
+                - alias: Postpone action is pressed
+                  platform: event
+                  event_type: mobile_app_notification_action
+                  event_data:
+                    action: "{{ action_postpone }}"
+                - alias: Suppress action is pressed
+                  platform: event
+                  event_type: mobile_app_notification_action
+                  event_data:
+                    action: "{{ action_suppress }}"
+              timeout:
+                hours: 0
+                minutes: 15
+                seconds: 0
+              continue_on_timeout: false
+            - alias: Handle chore based on action
+              choose:
+                - alias: If 'Complete' was pressed
+                  conditions:
+                    - condition: template
+                      value_template: "{{ wait.trigger.event.data.action == action_complete }}"
+                  sequence:
+                    - alias: Set chore to completed
+                      service: todo.update_item
+                      data:
+                        status: completed
+                        item: "{{ chore.summary }}"
+                      target:
+                        entity_id: "{{ input_todo_list }}"
+                    - alias: Add new chore with updated due date
+                      service: todo.add_item
+                      target:
+                        entity_id: "{{ input_todo_list }}"
+                      data:
+                        description: "{{ chore.description }}"
+                        due_datetime: "{{ now() + as_timedelta(chore_repeat) }}"
+                        item: "{{ chore.summary }}"
+                - alias: If 'Postpone' was pressed
+                  conditions:
+                    - condition: template
+                      value_template: "{{ wait.trigger.event.data.action == action_postpone }}"
+                  sequence:
+                    - alias: Update chore due date to postpone
+                      service: todo.update_item
+                      data:
+                        due_datetime: "{{ now() + timedelta(days=input_postpone_duration) }}"
+                        item: "{{ chore.summary }}"
+                      target:
+                        entity_id: "{{ input_todo_list }}"
